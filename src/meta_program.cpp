@@ -420,6 +420,23 @@ struct HashTable {
     u64* vals;
 };
 
+b32 table_find_empty_slot(HashTable* table, u64 key, u32* out_slot) {
+    b32 result = false;
+    for (u32 i = 0; i < table->capacity; ++i) {
+        u32 slot = (key + i) % table->capacity;
+        if (!table->keys[slot] || table->keys[slot] == table->TOMBSTONE) {
+            result = true;
+            *out_slot = slot;
+            break;
+        } else if (table->keys[slot] == key) {
+            // NOTE: Hash collision! These aren't handled by this table, so now your program is wrong somehow. Sorry.
+            //       In debug, let's assert:
+            INVALID_CODE_PATH;
+        }
+    }
+    return result;
+}
+
 void resize_table(HashTable* table, u32 new_capacity) {
     if (new_capacity > table->capacity) {
         u32 old_capacity = table->capacity;
@@ -434,10 +451,12 @@ void resize_table(HashTable* table, u32 new_capacity) {
             for (u32 index = 0; index < old_capacity; ++index) {
                 u64 old_key = old_keys[index];
                 u64 old_val = old_vals[index];
-                if (old_key) {
-                    u32 slot = old_key % table->capacity;
-                    table->keys[slot] = old_key;
-                    table->vals[slot] = old_val;
+                if (old_key && old_key != table->TOMBSTONE) {
+                    u32 slot;
+                    if (table_find_empty_slot(table, old_key, &slot)) {
+                        table->keys[slot] = old_key;
+                        table->vals[slot] = old_val;
+                    }
                 }
             }
 
@@ -458,19 +477,11 @@ void table_insert(HashTable* table, u64 key, u64 val) {
         --key; // NOTE: Not very elegant, but you get the point. Can't have a tombstone key.
     }
 
-    u64 slot = key % table->capacity;
-    for (u32 i = 0; i < table->capacity; ++i) {
-        u64 slot = (key + i) % table->capacity;
-        if (!table->keys[slot] || table->keys[slot] == table->TOMBSTONE) {
-            ++table->count;
-            table->keys[slot] = key;
-            table->vals[slot] = val;
-            break;
-        } else if (table->keys[slot] == key) {
-            // NOTE: Hash collision! These aren't handled by this table, so now your program is wrong somehow. Sorry.
-            //       In debug, let's assert:
-            INVALID_CODE_PATH;
-        }
+    u32 slot;
+    if (table_find_empty_slot(table, key, &slot)) {
+        ++table->count;
+        table->keys[slot] = key;
+        table->vals[slot] = val;
     }
 }
 
@@ -485,14 +496,10 @@ b32 table_lookup(HashTable* table, u64 key, u64* val) {
         }
 
         for (u32 i = 0; i < table->capacity; ++i) {
-            u64 slot = (key + i) % table->capacity;
-            if (table->keys[slot]) {
-                if (table->keys[slot] == key) {
-                    result = true;
-                    *val = table->vals[slot];
-                    break;
-                }
-            } else {
+            u32 slot = (key + i) % table->capacity;
+            if (table->keys[slot] == key) {
+                result = true;
+                *val = table->vals[slot];
                 break;
             }
         }
@@ -1427,7 +1434,8 @@ int main(int argc, char** argv) {
 
         while (peek_token(&parser) != CLEX_eof) {
             if (peek_token(&parser) == CLEX_parse_error) {
-                error_at_token(&parser, "Internal parser error. Sorry!");
+                warn_at_token(&parser, "Internal parser error. Sorry!");
+                break;
             }
 
             char* parse_point = parser.lex.parse_point;
