@@ -345,13 +345,14 @@ void ensure_space(Array<T>* array, u32 count) {
 }
 
 template <typename T>
-T* array_add(Array<T>* array, T* value = 0) {
+u32 array_add(Array<T>* array, T* value = 0) {
     ensure_space(array, 1);
-    T* result = array->data + array->count++;
+    u32 result = array->count++;
+    T* item = array->data + result;
     if (value) {
-        *result = *value;
+        *item = *value;
     } else {
-        *result = {};
+        *item = {};
     }
     return result;
 }
@@ -379,7 +380,7 @@ struct BlockArray {
 };
 
 template <typename T>
-inline T* array_add(BlockArray<T>* array, T* value = 0) {
+inline T* block_array_add(BlockArray<T>* array, T* value = 0) {
     if (!array->first_block ||
         (array->first_block->count == array->BLOCK_CAPACITY))
     {
@@ -401,12 +402,14 @@ inline T* array_add(BlockArray<T>* array, T* value = 0) {
 }
 
 template <typename T>
-inline void free_array(BlockArray<T>* array) {
-    while (array->first_block) {
-        auto block = SllStackPop(array->first_block);
-        heap_free(block);
+inline void free_block_array(BlockArray<T>* array) {
+    if (array->first_block) {
+        while (array->first_block) {
+            auto block = SllStackPop(array->first_block);
+            heap_free(block);
+        }
+        zero_struct(array);
     }
-    zero_struct(array);
 }
 
 struct HashTable {
@@ -578,7 +581,11 @@ u64 hash_string(char* string, u64* out_len = 0) {
 //
 
 struct Intern {
-    char* s;
+    union {
+        char* string;
+        u64 unique_id;
+    };
+    u64 hash;
 };
 
 umm intern_strings_capacity;
@@ -588,20 +595,18 @@ Intern* intern_strings;
 Intern null_string;
 
 inline b32 interned_strings_are_equal(Intern a, Intern b) {
-    b32 result = (a.s == b.s);
+    b32 result = (a.string == b.string);
     return result;
 }
 
-Intern* get_intern_string_slot(char* string, umm* out_len = 0) {
+Intern* get_intern_string_slot(char* string, u64 hash) {
     Intern* result = 0;
 
-    u64 len;
-    u64 hash = hash_string(string, &len);
     for (u64 i = 0; i < intern_strings_capacity; ++i) {
         u64 slot_i = (hash + i) % intern_strings_capacity;
         Intern* slot = intern_strings + slot_i;
-        if (slot->s) {
-            if (strings_are_equal(slot->s, string)) {
+        if (slot->string) {
+            if (strings_are_equal(slot->string, string)) {
                 result = slot;
             }
         } else {
@@ -610,8 +615,6 @@ Intern* get_intern_string_slot(char* string, umm* out_len = 0) {
 
         if (result) break;
     }
-
-    if (out_len) *out_len = len;
 
     return result;
 }
@@ -625,6 +628,9 @@ Intern intern_string(char* string) {
 
     Intern result = null_string;
     if (string) {
+        u64 len;
+        u64 hash = hash_string(string, &len);
+
         if (!intern_strings_capacity) intern_strings_capacity = 512;
         if (!intern_strings) {
             intern_strings = alloc_array(intern_strings_capacity, Intern);
@@ -641,19 +647,19 @@ Intern intern_string(char* string) {
 
             for (u64 i = 0; i < old_capacity; ++i) {
                 Intern old_string = old_strings[i];
-                if (old_string.s) {
-                    *get_intern_string_slot(old_string.s) = old_string;
+                if (old_string.string) {
+                    *get_intern_string_slot(old_string.string, old_string.hash) = old_string;
                 }
             }
 
             heap_free(old_strings);
         }
 
-        u64 len;
-        Intern* slot = get_intern_string_slot(string, &len);
-        if (!slot->s) {
+        Intern* slot = get_intern_string_slot(string, hash);
+        if (!slot->string) {
             ++intern_strings_count;
-            slot->s = alloc_copy_string(len, string);
+            slot->string = alloc_copy_string(len, string);
+            slot->hash = hash;
         }
 
         result = *slot;
@@ -669,10 +675,12 @@ Intern intern_string(char* string) {
 struct Decl;
 
 enum MemberFlag {
-    MemberFlag_IsPointer  = 0x1,
-    MemberFlag_IsPrivate  = 0x2,
-    MemberFlag_IsVolatile = 0x4,
-    MemberFlag_IsConst    = 0x8,
+    MemberFlag_Pointer   = 0x1,
+    MemberFlag_Private   = 0x2,
+    MemberFlag_Volatile  = 0x4,
+    MemberFlag_Const     = 0x8,
+    MemberFlag_Static    = 0x10,
+    MemberFlag_Constexpr = 0x20,
 };
 
 struct MemberDef {
@@ -682,7 +690,7 @@ struct MemberDef {
 };
 
 struct Namespace {
-    Namespace* next_in_stack;
+    Namespace* next;
 
     HashTable decl_table;
     Array<Decl*> decls;
@@ -907,13 +915,12 @@ void error_at_token(Parser* parser, char* fmt, ...) {
 }
 
 void push_namespace(Parser* parser, Namespace* ns) {
-    ns->next_in_stack = parser->first_namespace;
-    parser->first_namespace = ns;
+    SllStackPush(parser->first_namespace, ns);
 }
 
 void pop_namespace(Parser* parser) {
     Assert(parser->first_namespace != &parser->global_namespace); // Don't pop the global stack!
-    parser->first_namespace = parser->first_namespace->next_in_stack;
+    (void)SllStackPop(parser->first_namespace);
 }
 
 void free_decl(Parser* parser, Decl* decl) {
@@ -924,31 +931,32 @@ void free_decl(Parser* parser, Decl* decl) {
 void free_namespace_recursively(Parser* parser, Namespace* ns) {
     for (u32 decl_index = 0; decl_index < ns->decls.count; ++decl_index) {
         Decl* decl = ns->decls[decl_index];
-        if (decl->ns.decls.count) {
-            free_namespace_recursively(parser, &decl->ns);
-        }
+        free_namespace_recursively(parser, &decl->ns);
         free_decl(parser, decl);
     }
     free_table(&ns->decl_table);
     free_array(&ns->decls);
 }
 
-Decl* add_decl(Parser* parser) {
+Decl* add_decl(Parser* parser, Intern name) {
     if (!parser->first_free_decl) {
-        parser->first_free_decl = array_add(&parser->decl_store);
+        parser->first_free_decl = block_array_add(&parser->decl_store);
     }
 
     Decl* result = parser->first_free_decl;
     parser->first_free_decl = result->next;
 
+    result->name = name;
+
     return result;
 }
 
-Decl* remove_last_top_level_decl_and_free_children(Parser* parser) {
+Decl* free_last_top_level_decl_and_children(Parser* parser) {
     Decl* to_free = parser->top_level_decl_being_parsed;
     parser->top_level_decl_being_parsed = 0;
 
     if (to_free) {
+        free_namespace_recursively(parser, &to_free->ns);
         free_decl(parser, to_free);
     }
 
@@ -958,18 +966,17 @@ Decl* remove_last_top_level_decl_and_free_children(Parser* parser) {
 Decl* get_type_by_name_internal(Parser* parser, Namespace* first_ns, Intern name, b32 is_declaration) {
     Decl* result = 0;
 
-    u64 hash = hash_string(name.s);
-    for (Namespace* ns = first_ns; ns; ns = ns->next_in_stack) {
-        b32 will_allocate = (is_declaration || !ns->next_in_stack);
-        if ((ns->decls.count > 0) || will_allocate) {
+    ForSll (ns, first_ns) {
+        b32 make_new_decl = (is_declaration || !ns->next);
+        if ((ns->decls.count > 0) || make_new_decl) {
             u64 type_index;
-            if (table_lookup(&ns->decl_table, hash, &type_index)) {
+            if (table_lookup(&ns->decl_table, name.unique_id, &type_index)) {
                 result = ns->decls[type_index];
-            } else if (will_allocate) {
-                result = add_decl(parser);
-                result->name = name;
-                array_add(&ns->decls, &result);
-                table_insert(&ns->decl_table, hash, ns->decls.count - 1);
+            } else if (make_new_decl) {
+                // ns->decl_table[name] = add_decl(parser, name);
+                result = add_decl(parser, name);
+                table_insert(&ns->decl_table, name.unique_id, array_add(&ns->decls, &result));
+
                 if (is_declaration && (ns == &parser->global_namespace)) {
                     parser->top_level_decl_being_parsed = result;
                 }
@@ -991,7 +998,7 @@ Decl* declare_type_by_name(Parser* parser, Intern name) {
 }
 
 Decl* add_anonymous_declaration(Parser* parser) {
-    Decl* result = add_decl(parser);
+    Decl* result = add_decl(parser, null_string);
     result->flags |= DeclFlag_Anonymous;
     return result;
 }
@@ -1097,10 +1104,14 @@ Intern expect_id(Parser* parser) {
 u32 parse_member_keywords(Parser* parser) {
     u32 result = 0;
     if (match_id(parser, "volatile")) {
-        result |= MemberFlag_IsVolatile;
+        result |= MemberFlag_Volatile;
     } else if (match_id(parser, "const")) {
         // TODO: pointer to const versus const pointer?
-        result |= MemberFlag_IsConst;
+        result |= MemberFlag_Const;
+    } else if (match_id(parser, "static")) {
+        result |= MemberFlag_Static;
+    } else if (match_id(parser, "constexpr")) {
+        result |= MemberFlag_Constexpr;
     }
     return result;
 }
@@ -1211,14 +1222,14 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
                         {
                             has_instances = true;
 
-                            MemberDef* member = array_add(&type->members);
-                            member->flags |= member_flags;
+                            MemberDef member = {};
+                            member.flags |= member_flags;
 
-                            if (is_private) member->flags |= MemberFlag_IsPrivate;
+                            if (is_private) member.flags |= MemberFlag_Private;
 
-                            member->type = member_type;
-                            member->name = member_name;
-                            if (is_pointer) member->flags |= MemberFlag_IsPointer;
+                            member.type = member_type;
+                            member.name = member_name;
+                            if (is_pointer) member.flags |= MemberFlag_Pointer;
 
                             while (consume_token(parser, '[')) {
                                 seek_and_consume_token(parser, ']');
@@ -1227,6 +1238,8 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
                             if (consume_token(parser, '=')) {
                                 seek_token(parser, ';');
                             }
+
+                            array_add(&type->members, &member);
                         } else {
                             warn_at_token(parser, "Member functions / operator overloads are not (yet) indexed.");
 
@@ -1251,7 +1264,7 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
                 if (!has_instances && (member_type->flags & DeclFlag_Anonymous)) {
                     ForArray (&member_type->members) {
                         MemberDef member = *it;
-                        member.flags = toggle_flag(member.flags, MemberFlag_IsPrivate, is_private);
+                        member.flags = toggle_flag(member.flags, MemberFlag_Private, is_private);
                         array_add(&type->members, &member);
                     }
                 }
@@ -1289,12 +1302,13 @@ Decl* parse_enum(Parser* parser) {
 
     if (consume_token(parser, '{')) {
         while (!consume_token(parser, '}')) {
-            MemberDef* member = array_add(&type->members);
-            member->type = value_type;
-            member->name = expect_id(parser);
+            MemberDef member = {};
+            member.type = value_type;
+            member.name = expect_id(parser);
             while (peek_token(parser) != CLEX_eof && !consume_token(parser, ',')) {
                 next_token(parser);
             }
+            array_add(&type->members, &member);
         }
     }
 
@@ -1368,22 +1382,22 @@ void print_type(Decl* type, int depth = 0) {
 
             b32 is_private = (type->kind == Decl_Class);
 
-            print_line(depth, "%s %s (0x%llX) {\n", keyword, type->name.s, (umm)type);
+            print_line(depth, "%s %s (0x%llX) {\n", keyword, type->name.string, (umm)type);
 
             ++depth;
             ForArray (&type->members) {
-                b32 member_is_private = it->flags & MemberFlag_IsPrivate;
+                b32 member_is_private = it->flags & MemberFlag_Private;
                 if (is_private != member_is_private) {
                     is_private  = member_is_private;
                     printf("%s:\n", is_private ? "private" : "public");
                 }
                 print_line(depth, "%s%s%s (0x%llX) %s%s;\n",
-                    (it->flags & MemberFlag_IsConst ? "const " : ""),
-                    (it->flags & MemberFlag_IsVolatile ? "volatile " : ""),
-                    it->type->name,
+                    (it->flags & MemberFlag_Const ? "const " : ""),
+                    (it->flags & MemberFlag_Volatile ? "volatile " : ""),
+                    it->type->name.string,
                     (umm)it->type,
-                    (it->flags & MemberFlag_IsPointer ? "*" : ""),
-                    it->name
+                    (it->flags & MemberFlag_Pointer ? "*" : ""),
+                    it->name.string
                 );
             }
             --depth;
@@ -1392,7 +1406,7 @@ void print_type(Decl* type, int depth = 0) {
         } break;
 
         case Decl_Enum: {
-            print_line(depth, "enum %s (0x%llX) {\n", type->name.s, (umm)type);
+            print_line(depth, "enum %s (0x%llX) {\n", type->name.string, (umm)type);
 
             ++depth;
             ForArray (&type->members) {
@@ -1404,7 +1418,7 @@ void print_type(Decl* type, int depth = 0) {
         } break;
 
         case Decl_TypeDef: {
-            print_line(depth, "typedef %s %s;", type->typedef_src->name.s, type->name.s);
+            print_line(depth, "typedef %s %s;", type->typedef_src->name.string, type->name.string);
         } break;
 
         case Decl_Stub: {
@@ -1443,9 +1457,9 @@ int main(int argc, char** argv) {
             int error_code = setjmp(parser.error_jmp);
             if (error_code) {
                 // NOTE: Throw away most recent the top level decl, cuz it errored out, and is therefore garbage
-                Decl* freed_decl = remove_last_top_level_decl_and_free_children(&parser);
+                Decl* freed_decl = free_last_top_level_decl_and_children(&parser);
                 if (freed_decl) {
-                    warn(&parser, "Top-level declaration %s and sub-declarations have been thrown out, because there was a parsing error.", freed_decl->name.s);
+                    warn(&parser, "Top-level declaration %s and sub-declarations have been thrown out, because there was a parsing error.", freed_decl->name.string);
                 }
                 // NOTE: And reset to the global namespace
                 // TODO: We could probably just ensure when parsing top level declarations we're always
