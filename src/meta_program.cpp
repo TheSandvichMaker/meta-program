@@ -1,6 +1,3 @@
-// TODO:
-// - Write my own lexer, and then handle preprocessor stuff properly...
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -74,7 +71,7 @@ namespace {
 #define STB_C_LEX_DEFINE_ALL_TOKEN_NAMES  N   // if Y, all CLEX_ token names are defined, even if never returned
                                               // leaving it as N should help you catch config bugs
 
-#define STB_C_LEX_DISCARD_PREPROCESSOR    Y   // discard C-preprocessor directives (e.g. after prepocess
+#define STB_C_LEX_DISCARD_PREPROCESSOR    N   // discard C-preprocessor directives (e.g. after prepocess
                                               // still have #line, #pragma, etc)
 
 //#define STB_C_LEX_ISWHITE(str)    ... // return length in bytes of whitespace characters if first char is whitespace
@@ -247,12 +244,12 @@ private:
 
 #define Assert(x) assert(x)
 
-#define ForArray(array) \
-    for (auto it = (array)->data, it_end = (array)->data + (array)->count; it < it_end; ++it)
+#define ForArray(it, array) \
+    for (auto it = (array)->data, it##_end = (array)->data + (array)->count; it < it##_end; ++it)
 
-#define ForBlockArray(array) \
-    for (auto block = (array)->first_block; block; block = block->next) \
-    for (auto it = block->data, it_end = it + block->count; it < it_end; ++it)
+#define ForBlockArray(it, array) \
+    for (auto it##_block = (array)->first_block; it##_block; it##_block = it##_block->next) \
+    for (auto it = it##_block->data, it##_end = it + it##_block->count; it < it##_end; ++it)
 
 #define INVALID_CODE_PATH Assert(!"Invalid Code Path");
 #define INVALID_DEFAULT_CASE default: { Assert(!"Invalid Default Case"); } break;
@@ -435,6 +432,7 @@ b32 table_find_empty_slot(HashTable* table, u64 key, u32* out_slot) {
             // NOTE: Hash collision! These aren't handled by this table, so now your program is wrong somehow. Sorry.
             //       In debug, let's assert:
             INVALID_CODE_PATH;
+            fprintf(stderr, "A hashtable has had a hash collision. Buy a lottery ticket.\n");
         }
     }
     return result;
@@ -696,7 +694,8 @@ struct Namespace {
     Array<Decl*> decls;
 };
 
-enum DeclarationFlag {
+enum DeclFlag {
+    DeclFlag_ForwardDeclare = 0x1,
     DeclFlag_Anonymous = 0x2,
 };
 
@@ -736,11 +735,139 @@ struct Decl {
 };
 
 //
+// NOTE: Lexer
+//
+
+#ifdef USE_NEW_LEXER
+enum TokenKind {
+    Token_EOF = 0,
+    /* chars */
+    Token_LastCharToken = 255,
+    /* non-char tokens */
+    Token_Error,
+    Token_Identifier,
+    Token_Literal,
+};
+
+struct Lexer {
+    char* input_stream;
+    char* at;
+
+    u32 string_store_capacity;
+    char* string_store;
+
+    TokenKind token;
+
+    char* token_start;
+    char* token_end;
+
+    u32   string_length;
+    char* string;
+    s64   integer;
+    f64   real;
+};
+
+void init_lexer(Lexer* lexer, char* stream, u32 string_store_capacity, char* string_store) {
+    zero_struct(lexer);
+
+    lexer->input_stream = stream;
+    lexer->parse_point = lexer->input_stream;
+
+    lexer->string_store_capacity = string_store_capacity;
+    lexer->string_store = string_store;
+}
+
+// TODO: Lexer error-reporting, how do we wanna do it?
+//       Could do the Token_Error kind of thing, and then call error_at_token(parser, ...)
+//       when calling next_token(parser).
+
+b32 token_error(Lexer* lexer, char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(lexer->string_store, lexer->string_store_capacity, fmt, args);
+    va_end(args);
+
+    lexer->string = lexer->string_store;
+    lexer->token  = Token_Error;
+    return false;
+}
+
+b32 token(Lexer* lexer, TokenKind kind, char* token_start, char* token_end) {
+    lexer->token       = kind;
+    lexer->token_start = token_start;
+    lexer->token_end   = token_end;
+    lexer->at          = token_end + 1;
+    return true;
+}
+
+b32 next_token(Lexer* lexer) {
+    char* at = lexer->at;
+    while (*at == ' '  ||
+           *at == '\t' ||
+           *at == '\v')
+    {
+        ++at;
+    }
+
+    if (at[0] == '/' && at[1] == '/') {
+        while (*at) {
+            if (*at == '\r' || *at == '\n') {
+                at += (at[0] + at[1] == '\r' + '\n' ? 2 : 1);
+                break;
+            }
+            ++at;
+        }
+    }
+
+    if (at[0] == '/' && at[1] == '*') {
+        at += 2;
+        while (*at && (at[0] != '*' && at[1] != '/')) {
+            ++at;
+        }
+        at += 2;
+    }
+
+    if (!*at) {
+        lexer->token = Token_EOF;
+    }
+
+    switch (*at) {
+        default: {
+            if (((*at >= 'a') && (*at <= 'z')) ||
+                ((*at >= 'A') && (*at <= 'Z')) ||
+                (*at == '_') || ((u8)*at >= 128))
+            {
+                u32 n = 0;
+                lexer->string = lexer->string_store;
+                do {
+                    if (n + 1 > lexer->string_store_capacity) {
+                        return token_error(lexer, "Identifier too large for string store.");
+                    }
+                    lexer->string[n] = at[n];
+                    ++n;
+                } while (((*at >= 'a') && (*at <= 'z')) ||
+                         ((*at >= 'A') && (*at <= 'Z')) ||
+                         ((*at >= '0') && (*at <= '9')) ||
+                         (*at == '_') || ((u8)*at >= 128));
+                lexer->string_length = n;
+                lexer->string[n] = 0;
+                return token(lexer, Token_Identifier, at, at + n - 1);
+            }
+        } break;
+    }
+}
+#endif
+
+//
 // NOTE: Parser
 //
 
 struct Parser {
+#ifdef USE_NEW_LEXER
+    Lexer lex;
+#else
     stb_lexer lex;
+#endif
 
     char* file_name;
 
@@ -914,13 +1041,136 @@ void error_at_token(Parser* parser, char* fmt, ...) {
     longjmp(parser->error_jmp, 1);
 }
 
+b32 next_token(Parser* parser) {
+    parser->error_loc_first_char = parser->lex.where_firstchar;
+    parser->error_loc_last_char  = parser->lex.where_lastchar;
+    return stb_c_lexer_get_token(&parser->lex);
+}
+
+long peek_token(Parser* parser) {
+    return parser->lex.token;
+}
+
+b32 match_token(Parser* parser, long token) {
+    b32 result = false;
+    if (peek_token(parser) == token) {
+        result = true;
+        next_token(parser);
+    } 
+    return result;
+}
+
+b32 seek_token(Parser* parser, long token) {
+    b32 result = false;
+    while (peek_token(parser) != CLEX_eof) {
+        if (peek_token(parser) == token) {
+            result = true;
+            break;
+        }
+        next_token(parser);
+    }
+    return result;
+}
+
+b32 seek_and_consume_token(Parser* parser, long token) {
+    b32 result = false;
+    while (peek_token(parser) != CLEX_eof) {
+        if (match_token(parser, token)) {
+            result = true;
+            break;
+        }
+        next_token(parser);
+    }
+    return result;
+}
+
+b32 seek_and_consume_balanced_token_pair(Parser* parser, long opening_token, long closing_token) {
+    b32 result = false;
+
+    u32 depth = 0;
+    while (peek_token(parser) != CLEX_eof) {
+        if (match_token(parser, opening_token)) {
+            ++depth;
+        } else if (match_token(parser, closing_token)) {
+            --depth;
+        } else if (depth > 0) {
+            next_token(parser);
+        } else {
+            break;
+        }
+    }
+
+    return result;
+}
+
+void expect_token(Parser* parser, long token) {
+    if (!match_token(parser, token)) {
+        error_at_token(parser, "Expected token '%s'", get_token_name(token));
+    }
+}
+
+b32 match_id(Parser* parser, char* id) {
+    b32 result = false;
+    if (0 == strcmp(parser->lex.string, id)) {
+        result = true;
+        next_token(parser);
+    }
+    return result;
+}
+
+b32 consume_id(Parser* parser, Intern* out_id = 0) {
+    b32 result = false;
+    if (peek_token(parser) == CLEX_id) {
+        result = true;
+        if (out_id) *out_id = intern_string(parser->lex.string);
+        next_token(parser);
+    }
+    return result;
+}
+
+Intern expect_id(Parser* parser) {
+    Intern result = {};
+    if (peek_token(parser) == CLEX_id) {
+        result = intern_string(parser->lex.string);
+        next_token(parser);
+    } else {
+        error_at_token(parser, "Expected identifier.");
+    }
+    return result;
+}
+
+void skip_preprocessor(Parser* parser) {
+    b32 multiline = false;
+    char* p = parser->lex.parse_point;
+    while (p != parser->lex.eof) {
+        if ((*p == '\r') || (*p == '\n')) {
+            if (*p == '\r') ++p;
+            if (*p == '\n') ++p;
+
+            if (multiline) {
+                multiline = false;
+            } else {
+                break;
+            }
+        } else if (*p == '\\') {
+            multiline = true;
+        }
+        ++p;
+    }
+    parser->lex.parse_point = p;
+    next_token(parser);
+}
+
 void push_namespace(Parser* parser, Namespace* ns) {
     SllStackPush(parser->first_namespace, ns);
 }
 
 void pop_namespace(Parser* parser) {
-    Assert(parser->first_namespace != &parser->global_namespace); // Don't pop the global stack!
-    (void)SllStackPop(parser->first_namespace);
+    if (parser->first_namespace != &parser->global_namespace) { // Don't pop the global stack!
+        (void)SllStackPop(parser->first_namespace);
+    } else {
+        INVALID_CODE_PATH;
+    }
 }
 
 void free_decl(Parser* parser, Decl* decl) {
@@ -973,7 +1223,6 @@ Decl* get_type_by_name_internal(Parser* parser, Namespace* first_ns, Intern name
             if (table_lookup(&ns->decl_table, name.unique_id, &type_index)) {
                 result = ns->decls[type_index];
             } else if (make_new_decl) {
-                // ns->decl_table[name] = add_decl(parser, name);
                 result = add_decl(parser, name);
                 table_insert(&ns->decl_table, name.unique_id, array_add(&ns->decls, &result));
 
@@ -1000,104 +1249,6 @@ Decl* declare_type_by_name(Parser* parser, Intern name) {
 Decl* add_anonymous_declaration(Parser* parser) {
     Decl* result = add_decl(parser, null_string);
     result->flags |= DeclFlag_Anonymous;
-    return result;
-}
-
-b32 next_token(Parser* parser) {
-    parser->error_loc_first_char = parser->lex.where_firstchar;
-    parser->error_loc_last_char  = parser->lex.where_lastchar;
-    return stb_c_lexer_get_token(&parser->lex);
-}
-
-long peek_token(Parser* parser) {
-    return parser->lex.token;
-}
-
-b32 consume_token(Parser* parser, long token) {
-    b32 result = false;
-    if (peek_token(parser) == token) {
-        result = true;
-        next_token(parser);
-    } 
-    return result;
-}
-
-b32 seek_token(Parser* parser, long token) {
-    b32 result = false;
-    while (peek_token(parser) != CLEX_eof) {
-        if (peek_token(parser) == token) {
-            result = true;
-            break;
-        }
-        next_token(parser);
-    }
-    return result;
-}
-
-b32 seek_and_consume_token(Parser* parser, long token) {
-    b32 result = false;
-    while (peek_token(parser) != CLEX_eof) {
-        if (consume_token(parser, token)) {
-            result = true;
-            break;
-        }
-        next_token(parser);
-    }
-    return result;
-}
-
-b32 seek_and_consume_balanced_token_pair(Parser* parser, long opening_token, long closing_token) {
-    b32 result = false;
-
-    u32 depth = 0;
-    while (peek_token(parser) != CLEX_eof) {
-        if (consume_token(parser, opening_token)) {
-            ++depth;
-        } else if (consume_token(parser, closing_token)) {
-            --depth;
-        } else if (depth > 0) {
-            next_token(parser);
-        } else {
-            break;
-        }
-    }
-
-    return result;
-}
-
-void expect_token(Parser* parser, long token) {
-    if (!consume_token(parser, token)) {
-        error_at_token(parser, "Expected token '%s'", get_token_name(token));
-    }
-}
-
-b32 match_id(Parser* parser, char* id) {
-    b32 result = false;
-    if (0 == strcmp(parser->lex.string, id)) {
-        result = true;
-        next_token(parser);
-    }
-    return result;
-}
-
-b32 consume_id(Parser* parser, Intern* out_id = 0) {
-    b32 result = false;
-    if (peek_token(parser) == CLEX_id) {
-        result = true;
-        if (out_id) *out_id = intern_string(parser->lex.string);
-        next_token(parser);
-    }
-    return result;
-}
-
-Intern expect_id(Parser* parser) {
-    Intern result = {};
-    if (peek_token(parser) == CLEX_id) {
-        result = intern_string(parser->lex.string);
-        next_token(parser);
-    } else {
-        error_at_token(parser, "Expected identifier.");
-    }
     return result;
 }
 
@@ -1150,28 +1301,33 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
 
     Intern name;
     if (consume_id(parser, &name)) {
-        if (peek_token(parser) != '{') {
-            type = get_type_by_name(parser, name);    
-        } else {
+        if (peek_token(parser) == '{') {
             type = declare_type_by_name(parser, name);    
+        } else {
+            type = get_type_by_name(parser, name);    
+            if (type->kind == Decl_Stub) {
+                type->flags |= DeclFlag_ForwardDeclare;
+            }
         }
     } else {
         type = add_anonymous_declaration(parser);
         switch (kind) {
             case Decl_Struct: { type->name = intern_string("(anonymous struct)"); } break;
-            case Decl_Class: { type->name = intern_string("(anonymous class)"); } break;
-            case Decl_Union: { type->name = intern_string("(anonymous union)"); } break;
+            case Decl_Class : { type->name = intern_string("(anonymous class)"); } break;
+            case Decl_Union : { type->name = intern_string("(anonymous union)"); } break;
             INVALID_DEFAULT_CASE;
         }
     }
 
     type->kind = kind;
 
-    if (consume_token(parser, '{')) {
+    if (match_token(parser, '{')) {
+        type->flags &= ~DeclFlag_ForwardDeclare;
+
         push_namespace(parser, &type->ns);
 
         b32 is_private = (type->kind == Decl_Class);
-        while (!consume_token(parser, '}')) {
+        while (!match_token(parser, '}')) {
             if (match_id(parser, "public")) {
                 expect_token(parser, ':');
                 is_private = false;
@@ -1201,7 +1357,7 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
             }
 
             if (member_type) {
-                if (consume_token(parser, '<')) {
+                if (match_token(parser, '<')) {
                     u32 template_depth = 1;
                     while (template_depth > 0) {
                         if (peek_token(parser) == '<') ++template_depth;
@@ -1212,8 +1368,8 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
 
                 b32 has_instances = false;
                 do {
-                    b32 is_pointer = consume_token(parser, '*');
-                    b32 is_ref     = consume_token(parser, '&'); // NOTE: If this is the case, it must be a member function right? 
+                    b32 is_pointer = match_token(parser, '*');
+                    b32 is_ref     = match_token(parser, '&'); // NOTE: If this is the case, it must be a member function right? 
                                                                  //       I don't think you can have a regular reference member.
                     Intern member_name;
                     if (consume_id(parser, &member_name)) {
@@ -1231,11 +1387,11 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
                             member.name = member_name;
                             if (is_pointer) member.flags |= MemberFlag_Pointer;
 
-                            while (consume_token(parser, '[')) {
+                            while (match_token(parser, '[')) {
                                 seek_and_consume_token(parser, ']');
                             }
 
-                            if (consume_token(parser, '=')) {
+                            if (match_token(parser, '=')) {
                                 seek_token(parser, ';');
                             }
 
@@ -1254,15 +1410,15 @@ Decl* parse_struct(Parser* parser, DeclKind kind) {
                             error_at_token(parser, "Expected identifier for member declaration.");
                         }
                     }
-                } while (consume_token(parser, ','));
+                } while (match_token(parser, ','));
 
                 // TODO: This will now not spot a missing ;, but does that really matter? The compiler would.
-                consume_token(parser, ';');
+                match_token(parser, ';');
 
                 // NOTE: Copy out the members of fully anonymous struct declarations.
                 // TODO: Seems a bit inelegant.
                 if (!has_instances && (member_type->flags & DeclFlag_Anonymous)) {
-                    ForArray (&member_type->members) {
+                    ForArray (it, &member_type->members) {
                         MemberDef member = *it;
                         member.flags = toggle_flag(member.flags, MemberFlag_Private, is_private);
                         array_add(&type->members, &member);
@@ -1295,17 +1451,17 @@ Decl* parse_enum(Parser* parser) {
     type->kind = Decl_Enum;
 
     Intern value_type_name = intern_string("int");
-    if (consume_token(parser, ':')) {
+    if (match_token(parser, ':')) {
         value_type_name = expect_id(parser);
     }
     Decl* value_type = get_type_by_name(parser, value_type_name);
 
-    if (consume_token(parser, '{')) {
-        while (!consume_token(parser, '}')) {
+    if (match_token(parser, '{')) {
+        while (!match_token(parser, '}')) {
             MemberDef member = {};
             member.type = value_type;
             member.name = expect_id(parser);
-            while (peek_token(parser) != CLEX_eof && !consume_token(parser, ',')) {
+            while (peek_token(parser) != CLEX_eof && !match_token(parser, ',')) {
                 next_token(parser);
             }
             array_add(&type->members, &member);
@@ -1382,35 +1538,38 @@ void print_type(Decl* type, int depth = 0) {
 
             b32 is_private = (type->kind == Decl_Class);
 
-            print_line(depth, "%s %s (0x%llX) {\n", keyword, type->name.string, (umm)type);
-
-            ++depth;
-            ForArray (&type->members) {
-                b32 member_is_private = it->flags & MemberFlag_Private;
-                if (is_private != member_is_private) {
-                    is_private  = member_is_private;
-                    printf("%s:\n", is_private ? "private" : "public");
+            print_line(depth, "%s %s (0x%llX)", keyword, type->name.string, (umm)type);
+            if (type->flags & DeclFlag_ForwardDeclare) {
+                printf(";");
+            } else {
+                printf(" {\n");
+                ++depth;
+                ForArray (it, &type->members) {
+                    b32 member_is_private = it->flags & MemberFlag_Private;
+                    if (is_private != member_is_private) {
+                        is_private  = member_is_private;
+                        printf("%s:\n", is_private ? "private" : "public");
+                    }
+                    print_line(depth, "%s%s%s (0x%llX) %s%s;\n",
+                        (it->flags & MemberFlag_Const ? "const " : ""),
+                        (it->flags & MemberFlag_Volatile ? "volatile " : ""),
+                        it->type->name.string,
+                        (umm)it->type,
+                        (it->flags & MemberFlag_Pointer ? "*" : ""),
+                        it->name.string
+                    );
                 }
-                print_line(depth, "%s%s%s (0x%llX) %s%s;\n",
-                    (it->flags & MemberFlag_Const ? "const " : ""),
-                    (it->flags & MemberFlag_Volatile ? "volatile " : ""),
-                    it->type->name.string,
-                    (umm)it->type,
-                    (it->flags & MemberFlag_Pointer ? "*" : ""),
-                    it->name.string
-                );
+                --depth;
+                print_line(depth, "}");
             }
-            --depth;
-
-            print_line(depth, "}");
         } break;
 
         case Decl_Enum: {
             print_line(depth, "enum %s (0x%llX) {\n", type->name.string, (umm)type);
 
             ++depth;
-            ForArray (&type->members) {
-                print_line(depth, "%s,\n", it->name);
+            ForArray (it, &type->members) {
+                print_line(depth, "%s,\n", it->name.string);
             }
             --depth;
 
@@ -1422,7 +1581,7 @@ void print_type(Decl* type, int depth = 0) {
         } break;
 
         case Decl_Stub: {
-            print_line(depth, "%s", type->name);
+            print_line(depth, "%s", type->name.string);
         } break;
 
         default: {
@@ -1466,7 +1625,16 @@ int main(int argc, char** argv) {
                 //       back in the global namespace, not sure if that's better.
                 parser.first_namespace = &parser.global_namespace;
             } else {
-                parse_type(&parser);
+                if (match_token(&parser, '#')) {
+                    if (match_id(&parser, "include")) {
+                        /* TODO: include */
+                        skip_preprocessor(&parser);
+                    } else {
+                        skip_preprocessor(&parser);
+                    }
+                } else {
+                    parse_type(&parser);
+                }
             }
 
             parser.top_level_decl_being_parsed = 0;
