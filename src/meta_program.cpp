@@ -331,11 +331,15 @@ struct Array {
 
 template <typename T>
 void ensure_space(Array<T>* array, u32 count) {
-    if (array->capacity < (array->count + count)) {
+    u32 desired_count = (array->count + count);
+    if (array->capacity < desired_count) {
         if (!array->capacity) {
             array->capacity = 8;
         } else {
-            array->capacity *= 2;
+            array->capacity = 2*array->capacity;
+        }
+        if (array->capacity < desired_count) {
+            array->capacity = desired_count;
         }
         array->data = (T*)heap_realloc(array->data, sizeof(T)*array->capacity);
     }
@@ -1590,6 +1594,59 @@ void print_type(Decl* type, int depth = 0) {
     }
 }
 
+struct StringBuilder {
+    Array<u8> string;
+};
+
+void appendf(StringBuilder* builder, char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+
+    int text_size = vsnprintf(0, 0, fmt, args);
+
+    ensure_space(&builder->string, text_size + 1);
+    u8* append_at = builder->string.data + builder->string.count;
+
+    vsnprintf((char*)append_at, builder->string.capacity - builder->string.count, fmt, args);
+
+    builder->string.count += text_size;
+    append_at[text_size] = 0;
+
+    va_end(args);
+}
+
+char* as_c_string(StringBuilder* builder) {
+    char* result = (char*)builder->string.data;
+    return result;
+}
+
+void generate_cpp_style_type_info(StringBuilder* builder, Array<Decl*>* decls) {
+    appendf(builder, "namespace TypeInfo {\n");
+    ForArray (decl_at, decls) {
+        Decl* decl = *decl_at;
+        switch (decl->kind) {
+            case Decl_Struct:
+            case Decl_Class:
+            case Decl_Union: {
+                appendf(builder, "struct %s {\n", decl->name.string);
+                ForArray (member, &decl->members) {
+                    appendf(builder, "/* %s%s%s %s */\n",
+                            (member->flags & MemberFlag_Const ? "const " : ""),
+                            (member->flags & MemberFlag_Volatile ? "volatile " : ""),
+                            member->type->name.string,
+                            member->name.string);
+                }
+                appendf(builder, "}\n");
+            } break;
+
+            default: {
+                /* ... */
+            } break;
+        }
+    }
+    appendf(builder, "}\n");
+}
+
 }
 
 //
@@ -1643,7 +1700,8 @@ int main(int argc, char** argv) {
                 next_token(&parser);
             }
         }
-
+        
+#if 0
         printf("\n");
         printf("-------------\n");
         printf("Unknown types\n");
@@ -1669,6 +1727,11 @@ int main(int argc, char** argv) {
                 printf("\n\n");
             }
         }
+#else
+        StringBuilder builder = {};
+        generate_cpp_style_type_info(&builder, &parser.global_namespace.decls);
+        printf("%s", as_c_string(&builder));
+#endif
     } else {
         fprintf(stderr, "Could not open file :(\n");
     }
